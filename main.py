@@ -1,656 +1,696 @@
+import decimal
+import json
 import os
-from typing import Dict, Any, List
+import sys
+import time
+from enum import Enum
+from typing import Any
 
-import pandas as pd
 import requests
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
-
-app = FastAPI(title="Excel to Workiva JSON Demo")
-
-WORKIVA_API_URL = os.getenv("WORKIVA_API_URL", "")
-WORKIVA_BEARER_TOKEN = os.getenv("WORKIVA_BEARER_TOKEN", "")
 
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
-    return df
+CLIENT_ID = os.getenv("WORKIVA_CLIENT_ID", "").strip()
+CLIENT_SECRET = os.getenv("WORKIVA_CLIENT_SECRET", "").strip()
+CONTROL_SPREADSHEET_ID = os.getenv("WORKIVA_CONTROL_SPREADSHEET_ID", "").strip()
+CONTROL_SHEET_ID = os.getenv("WORKIVA_CONTROL_SHEET_ID", "").strip()
+CONTROL_CELL = os.getenv("WORKIVA_CONTROL_CELL", "B2").strip() or "B2"
+API_VERSION = os.getenv("WORKIVA_API_VERSION", "2026-01-01").strip()
+BASE_URL = os.getenv(
+    "WORKIVA_BASE_URL",
+    "https://api.eu.wdesk.com",
+).strip().rstrip("/")
+TARGET_NAME_TEXT = os.getenv(
+    "WORKIVA_TARGET_NAME_TEXT", "zero"
+).strip().casefold() or "zero"
+
+AUTH_URL = f"{BASE_URL}/oauth2/token"
+SS_API_URL = f"{BASE_URL}/spreadsheets"
+
+required_settings = {
+    "WORKIVA_CLIENT_ID": CLIENT_ID,
+    "WORKIVA_CLIENT_SECRET": CLIENT_SECRET,
+    "WORKIVA_CONTROL_SPREADSHEET_ID": CONTROL_SPREADSHEET_ID,
+    "WORKIVA_CONTROL_SHEET_ID": CONTROL_SHEET_ID,
+}
+missing_settings = [k for k, v in required_settings.items() if not v]
+if missing_settings:
+    raise RuntimeError(
+        "Missing required OpenShift environment variable(s): "
+        + ", ".join(missing_settings)
+    )
 
 
-def transform_excel_to_json(df: pd.DataFrame) -> Dict[str, Any]:
-    df = normalize_columns(df)
-
-    required = {"entity", "account", "amount", "period"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing required columns: {', '.join(sorted(missing))}")
-
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0)
-
-    records: List[Dict[str, Any]] = []
-    for _, row in df.iterrows():
-        records.append(
-            {
-                "entity": str(row["entity"]).strip(),
-                "account": str(row["account"]).strip(),
-                "period": str(row["period"]).strip(),
-                "value": float(row["amount"]),
-                "source": "client_excel_upload",
-            }
-        )
-
-    return {
-        "recordCount": len(records),
-        "records": records,
-    }
+class NumberPrecision(Enum):
+    BASIS_POINTS = 0.0001
+    HUNDREDTHS = 0.01
+    ONES = 1
+    THOUSANDS = 1_000
+    TEN_THOUSANDS = 10_000
+    MILLIONS = 1_000_000
+    HUNDRED_MILLIONS = 100_000_000
+    BILLIONS = 1_000_000_000
+    TRILLIONS = 1_000_000_000_000
 
 
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return r"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-      <meta charset="utf-8" />
-      <meta name="viewport" content="width=device-width, initial-scale=1" />
-      <title>Excel to Workiva JSON</title>
-      <style>
-        :root {
-          --bg: #f4f7fb;
-          --surface: #ffffff;
-          --surface-soft: #f8fafc;
-          --text: #172033;
-          --muted: #64748b;
-          --line: #dbe3ef;
-          --primary: #3157d5;
-          --primary-dark: #2444af;
-          --success: #138a62;
-          --danger: #c2414b;
-          --shadow: 0 24px 70px rgba(26, 39, 74, 0.12);
-          --radius: 22px;
+class ApiAuth:
+    def __init__(self):
+        self.headers = {
+            "X-Version": API_VERSION,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
         }
 
-        * { box-sizing: border-box; }
-
-        body {
-          margin: 0;
-          min-height: 100vh;
-          font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-          color: var(--text);
-          background:
-            radial-gradient(circle at 10% 0%, rgba(49, 87, 213, 0.14), transparent 30%),
-            radial-gradient(circle at 90% 15%, rgba(91, 168, 255, 0.14), transparent 28%),
-            var(--bg);
-        }
-
-        .shell {
-          width: min(1120px, calc(100% - 32px));
-          margin: 0 auto;
-          padding: 52px 0 64px;
-        }
-
-        .topbar {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 16px;
-          margin-bottom: 30px;
-        }
-
-        .brand {
-          display: flex;
-          align-items: center;
-          gap: 12px;
-          font-weight: 800;
-          letter-spacing: -0.02em;
-        }
-
-        .brand-mark {
-          display: grid;
-          place-items: center;
-          width: 42px;
-          height: 42px;
-          border-radius: 13px;
-          background: linear-gradient(135deg, #3157d5, #5b8def);
-          color: white;
-          box-shadow: 0 10px 28px rgba(49, 87, 213, 0.26);
-        }
-
-        .badge {
-          padding: 8px 12px;
-          border: 1px solid rgba(49, 87, 213, 0.16);
-          border-radius: 999px;
-          color: var(--primary);
-          background: rgba(49, 87, 213, 0.06);
-          font-size: 13px;
-          font-weight: 700;
-        }
-
-        .hero {
-          display: grid;
-          grid-template-columns: 1.05fr 0.95fr;
-          gap: 28px;
-          align-items: stretch;
-        }
-
-        .intro {
-          padding: 26px 10px 20px 0;
-        }
-
-        .eyebrow {
-          color: var(--primary);
-          font-size: 13px;
-          font-weight: 800;
-          letter-spacing: 0.12em;
-          text-transform: uppercase;
-          margin-bottom: 14px;
-        }
-
-        h1 {
-          margin: 0;
-          max-width: 700px;
-          font-size: clamp(38px, 5.5vw, 64px);
-          line-height: 1.02;
-          letter-spacing: -0.045em;
-        }
-
-        .lead {
-          max-width: 650px;
-          margin: 22px 0 28px;
-          color: var(--muted);
-          font-size: 18px;
-          line-height: 1.65;
-        }
-
-        .schema {
-          display: flex;
-          flex-wrap: wrap;
-          gap: 9px;
-        }
-
-        .chip {
-          padding: 8px 11px;
-          border-radius: 10px;
-          border: 1px solid var(--line);
-          background: rgba(255,255,255,.68);
-          color: #44516a;
-          font: 700 13px ui-monospace, SFMono-Regular, Menlo, monospace;
-        }
-
-        .card {
-          background: rgba(255,255,255,.94);
-          border: 1px solid rgba(219, 227, 239, .9);
-          border-radius: var(--radius);
-          box-shadow: var(--shadow);
-          padding: 28px;
-          backdrop-filter: blur(8px);
-        }
-
-        .card h2 {
-          margin: 0 0 6px;
-          font-size: 22px;
-          letter-spacing: -0.025em;
-        }
-
-        .card-subtitle {
-          margin: 0 0 20px;
-          color: var(--muted);
-          line-height: 1.5;
-        }
-
-        .dropzone {
-          display: block;
-          padding: 34px 20px;
-          border: 2px dashed #b8c5da;
-          border-radius: 18px;
-          text-align: center;
-          cursor: pointer;
-          background: var(--surface-soft);
-          transition: .2s ease;
-        }
-
-        .dropzone:hover,
-        .dropzone.dragover {
-          border-color: var(--primary);
-          background: #f3f6ff;
-          transform: translateY(-1px);
-        }
-
-        .drop-icon {
-          width: 54px;
-          height: 54px;
-          margin: 0 auto 14px;
-          display: grid;
-          place-items: center;
-          border-radius: 16px;
-          background: #e9efff;
-          color: var(--primary);
-          font-size: 26px;
-        }
-
-        .dropzone strong { display: block; font-size: 16px; }
-        .dropzone span { display: block; color: var(--muted); margin-top: 7px; font-size: 14px; }
-        input[type=file] { display: none; }
-
-        .file-row {
-          display: none;
-          align-items: center;
-          gap: 12px;
-          margin-top: 14px;
-          padding: 13px 14px;
-          border: 1px solid var(--line);
-          border-radius: 13px;
-          background: #fff;
-        }
-
-        .file-row.visible { display: flex; }
-        .file-icon { font-size: 22px; }
-        .file-meta { min-width: 0; flex: 1; }
-        .file-name { font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .file-size { margin-top: 3px; color: var(--muted); font-size: 12px; }
-
-        .actions {
-          display: grid;
-          grid-template-columns: 1fr 1fr;
-          gap: 10px;
-          margin-top: 18px;
-        }
-
-        button {
-          min-height: 46px;
-          border: 0;
-          border-radius: 12px;
-          padding: 0 16px;
-          cursor: pointer;
-          font-size: 14px;
-          font-weight: 800;
-          transition: .18s ease;
-        }
-
-        button:disabled { opacity: .5; cursor: not-allowed; }
-        .primary { background: var(--primary); color: white; }
-        .primary:hover:not(:disabled) { background: var(--primary-dark); transform: translateY(-1px); }
-        .secondary { background: #edf2f8; color: #334155; }
-        .secondary:hover:not(:disabled) { background: #e2e8f0; }
-
-        .status {
-          display: none;
-          margin-top: 15px;
-          padding: 12px 14px;
-          border-radius: 12px;
-          font-size: 14px;
-          line-height: 1.45;
-        }
-        .status.visible { display: block; }
-        .status.success { color: #0d6c4c; background: #eaf8f2; border: 1px solid #bee7d6; }
-        .status.error { color: #9d3039; background: #fff0f1; border: 1px solid #f3c7cb; }
-        .status.info { color: #38517d; background: #eff4ff; border: 1px solid #d5e0ff; }
-
-        .result {
-          margin-top: 28px;
-          display: none;
-        }
-        .result.visible { display: block; }
-
-        .result-head {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 12px;
-          margin-bottom: 12px;
-        }
-
-        .result-title { display: flex; align-items: baseline; gap: 10px; }
-        .result-title h2 { margin: 0; font-size: 20px; }
-        .record-count { color: var(--success); font-size: 13px; font-weight: 800; }
-
-        .result-actions { display: flex; gap: 8px; }
-        .small-btn { min-height: 36px; padding: 0 12px; font-size: 12px; }
-
-        pre {
-          margin: 0;
-          max-height: 460px;
-          overflow: auto;
-          border-radius: 16px;
-          padding: 20px;
-          background: #101827;
-          color: #d7e2f4;
-          font: 13px/1.65 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-          white-space: pre-wrap;
-          word-break: break-word;
-        }
-
-        .steps {
-          display: grid;
-          grid-template-columns: repeat(3, 1fr);
-          gap: 14px;
-          margin-top: 28px;
-        }
-
-        .step {
-          padding: 18px;
-          border: 1px solid var(--line);
-          border-radius: 16px;
-          background: rgba(255,255,255,.62);
-        }
-
-        .step-number {
-          width: 28px;
-          height: 28px;
-          display: grid;
-          place-items: center;
-          border-radius: 9px;
-          background: #e9efff;
-          color: var(--primary);
-          font-weight: 900;
-          font-size: 12px;
-          margin-bottom: 12px;
-        }
-
-        .step strong { display: block; margin-bottom: 5px; }
-        .step span { color: var(--muted); font-size: 13px; line-height: 1.45; }
-
-        footer {
-          margin-top: 30px;
-          text-align: center;
-          color: #8793a8;
-          font-size: 12px;
-        }
-
-        @media (max-width: 820px) {
-          .shell { padding-top: 28px; }
-          .hero { grid-template-columns: 1fr; }
-          .intro { padding-right: 0; }
-          .steps { grid-template-columns: 1fr; }
-        }
-
-        @media (max-width: 520px) {
-          .topbar { align-items: flex-start; }
-          .badge { display: none; }
-          .card { padding: 20px; }
-          .actions { grid-template-columns: 1fr; }
-          .result-head { align-items: flex-start; flex-direction: column; }
-        }
-      </style>
-    </head>
-    <body>
-      <main class="shell">
-        <div class="topbar">
-          <div class="brand">
-            <div class="brand-mark">↗</div>
-            <span>Data Bridge</span>
-          </div>
-          <div class="badge">FastAPI · OpenShift ready</div>
-        </div>
-
-        <section class="hero">
-          <div class="intro">
-            <div class="eyebrow">Excel → Workiva JSON</div>
-            <h1>Turn spreadsheet data into clean JSON.</h1>
-            <p class="lead">
-              Upload an Excel trial balance and convert it into a structured payload ready for review or delivery to Workiva.
-            </p>
-            <div class="schema" aria-label="Required Excel columns">
-              <span class="chip">entity</span>
-              <span class="chip">account</span>
-              <span class="chip">amount</span>
-              <span class="chip">period</span>
-            </div>
-
-            <div class="steps">
-              <div class="step"><div class="step-number">01</div><strong>Upload</strong><span>Select or drag in an .xlsx file.</span></div>
-              <div class="step"><div class="step-number">02</div><strong>Transform</strong><span>Validate columns and convert rows to JSON.</span></div>
-              <div class="step"><div class="step-number">03</div><strong>Review</strong><span>Inspect, copy, or download the generated payload.</span></div>
-            </div>
-          </div>
-
-          <div class="card">
-            <h2>Upload workbook</h2>
-            <p class="card-subtitle">Only .xlsx files are accepted. Your required columns are checked automatically.</p>
-
-            <label class="dropzone" id="dropzone" for="fileInput">
-              <div class="drop-icon">⇧</div>
-              <strong>Drop your Excel file here</strong>
-              <span>or click to browse from your computer</span>
-            </label>
-            <input id="fileInput" type="file" accept=".xlsx" />
-
-            <div class="file-row" id="fileRow">
-              <div class="file-icon">📄</div>
-              <div class="file-meta">
-                <div class="file-name" id="fileName"></div>
-                <div class="file-size" id="fileSize"></div>
-              </div>
-            </div>
-
-            <div class="actions">
-              <button class="primary" id="transformBtn" disabled>Transform to JSON</button>
-              <button class="secondary" id="workivaBtn" disabled>Send to Workiva</button>
-            </div>
-
-            <div class="status" id="status"></div>
-          </div>
-        </section>
-
-        <section class="result" id="result">
-          <div class="card">
-            <div class="result-head">
-              <div class="result-title">
-                <h2>JSON output</h2>
-                <span class="record-count" id="recordCount"></span>
-              </div>
-              <div class="result-actions">
-                <button class="secondary small-btn" id="copyBtn">Copy JSON</button>
-                <button class="secondary small-btn" id="downloadBtn">Download</button>
-              </div>
-            </div>
-            <pre id="jsonOutput"></pre>
-          </div>
-        </section>
-
-        <footer>Excel to Workiva JSON Demo · Built for a simple GitHub → OpenShift workflow</footer>
-      </main>
-
-      <script>
-        const fileInput = document.getElementById('fileInput');
-        const dropzone = document.getElementById('dropzone');
-        const fileRow = document.getElementById('fileRow');
-        const fileName = document.getElementById('fileName');
-        const fileSize = document.getElementById('fileSize');
-        const transformBtn = document.getElementById('transformBtn');
-        const workivaBtn = document.getElementById('workivaBtn');
-        const statusBox = document.getElementById('status');
-        const result = document.getElementById('result');
-        const jsonOutput = document.getElementById('jsonOutput');
-        const recordCount = document.getElementById('recordCount');
-        const copyBtn = document.getElementById('copyBtn');
-        const downloadBtn = document.getElementById('downloadBtn');
-
-        let selectedFile = null;
-        let currentPayload = null;
-
-        const formatBytes = (bytes) => {
-          if (!bytes) return '0 KB';
-          const kb = bytes / 1024;
-          return kb < 1024 ? `${kb.toFixed(1)} KB` : `${(kb / 1024).toFixed(1)} MB`;
-        };
-
-        function showStatus(message, type = 'info') {
-          statusBox.textContent = message;
-          statusBox.className = `status visible ${type}`;
-        }
-
-        function clearStatus() {
-          statusBox.className = 'status';
-          statusBox.textContent = '';
-        }
-
-        function setFile(file) {
-          clearStatus();
-          result.classList.remove('visible');
-          currentPayload = null;
-
-          if (!file) return;
-          if (!file.name.toLowerCase().endsWith('.xlsx')) {
-            selectedFile = null;
-            fileRow.classList.remove('visible');
-            transformBtn.disabled = true;
-            workivaBtn.disabled = true;
-            showStatus('Please choose an Excel .xlsx file.', 'error');
-            return;
-          }
-
-          selectedFile = file;
-          fileName.textContent = file.name;
-          fileSize.textContent = formatBytes(file.size);
-          fileRow.classList.add('visible');
-          transformBtn.disabled = false;
-          workivaBtn.disabled = false;
-        }
-
-        fileInput.addEventListener('change', () => setFile(fileInput.files[0]));
-
-        ['dragenter', 'dragover'].forEach(eventName => {
-          dropzone.addEventListener(eventName, (event) => {
-            event.preventDefault();
-            dropzone.classList.add('dragover');
-          });
-        });
-
-        ['dragleave', 'drop'].forEach(eventName => {
-          dropzone.addEventListener(eventName, (event) => {
-            event.preventDefault();
-            dropzone.classList.remove('dragover');
-          });
-        });
-
-        dropzone.addEventListener('drop', (event) => {
-          const file = event.dataTransfer.files[0];
-          setFile(file);
-        });
-
-        async function postFile(endpoint, loadingMessage) {
-          if (!selectedFile) return;
-
-          transformBtn.disabled = true;
-          workivaBtn.disabled = true;
-          showStatus(loadingMessage, 'info');
-
-          try {
-            const formData = new FormData();
-            formData.append('file', selectedFile);
-            const response = await fetch(endpoint, { method: 'POST', body: formData });
-            const data = await response.json();
-
-            if (!response.ok) {
-              throw new Error(data.detail || 'The request could not be completed.');
-            }
-            return data;
-          } catch (error) {
-            showStatus(error.message, 'error');
-            throw error;
-          } finally {
-            transformBtn.disabled = false;
-            workivaBtn.disabled = false;
-          }
-        }
-
-        transformBtn.addEventListener('click', async () => {
-          try {
-            const data = await postFile('/upload', 'Transforming workbook…');
-            currentPayload = data;
-            jsonOutput.textContent = JSON.stringify(data, null, 2);
-            recordCount.textContent = `${data.recordCount ?? 0} records`;
-            result.classList.add('visible');
-            showStatus('Transformation completed successfully.', 'success');
-            result.scrollIntoView({ behavior: 'smooth', block: 'start' });
-          } catch (_) {}
-        });
-
-        workivaBtn.addEventListener('click', async () => {
-          try {
-            const data = await postFile('/send-to-workiva', 'Sending payload to Workiva…');
-            currentPayload = data;
-            jsonOutput.textContent = JSON.stringify(data, null, 2);
-            recordCount.textContent = data.sentPayload?.recordCount != null ? `${data.sentPayload.recordCount} records sent` : 'Response received';
-            result.classList.add('visible');
-            showStatus(`Workiva request completed with status ${data.workivaStatusCode}.`, 'success');
-            result.scrollIntoView({ behavior: 'smooth', block: 'start' });
-          } catch (_) {}
-        });
-
-        copyBtn.addEventListener('click', async () => {
-          if (!currentPayload) return;
-          await navigator.clipboard.writeText(JSON.stringify(currentPayload, null, 2));
-          const oldText = copyBtn.textContent;
-          copyBtn.textContent = 'Copied';
-          setTimeout(() => copyBtn.textContent = oldText, 1200);
-        });
-
-        downloadBtn.addEventListener('click', () => {
-          if (!currentPayload) return;
-          const blob = new Blob([JSON.stringify(currentPayload, null, 2)], { type: 'application/json' });
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = 'workiva-payload.json';
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
-          URL.revokeObjectURL(url);
-        });
-      </script>
-    </body>
-    </html>
-    """
-
-
-@app.post("/upload")
-async def upload(file: UploadFile = File(...)):
-    if not file.filename or not file.filename.lower().endswith(".xlsx"):
-        raise HTTPException(status_code=400, detail="Please upload an .xlsx file")
-
-    try:
-        df = pd.read_excel(file.file, engine="openpyxl")
-        payload = transform_excel_to_json(df)
-        return JSONResponse(payload)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Transformation failed: {exc}")
-
-
-@app.post("/send-to-workiva")
-async def send_to_workiva(file: UploadFile = File(...)):
-    if not WORKIVA_API_URL or not WORKIVA_BEARER_TOKEN:
-        raise HTTPException(
-            status_code=400,
-            detail="Set WORKIVA_API_URL and WORKIVA_BEARER_TOKEN environment variables first.",
-        )
-
-    try:
-        df = pd.read_excel(file.file, engine="openpyxl")
-        payload = transform_excel_to_json(df)
-
-        response = requests.post(
-            WORKIVA_API_URL,
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {WORKIVA_BEARER_TOKEN}",
-                "Content-Type": "application/json",
-            },
-            timeout=30,
-        )
-
+    def get_auth_token(self) -> str:
+        print("Authenticating with Workiva...")
+        try:
+            response = requests.post(
+                AUTH_URL,
+                headers=self.headers,
+                data={
+                    "client_id": CLIENT_ID,
+                    "client_secret": CLIENT_SECRET,
+                    "grant_type": "client_credentials",
+                },
+                timeout=30,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"Could not connect to Workiva authentication API: {exc}"
+            ) from exc
+
+        print("Authentication status:", response.status_code)
+
+        if not response.ok:
+            raise RuntimeError(
+                "Workiva authentication failed.\n\n"
+                f"HTTP status: {response.status_code}\n"
+                f"Response: {response.text}"
+            )
+
+        access_token = response.json().get("access_token")
+        if not access_token:
+            raise RuntimeError(
+                "Authentication returned HTTP 200, but no access_token."
+            )
+
+        print("Authentication successful.")
+        return access_token
+
+
+class SpreadsheetApi:
+    def __init__(self, access_token: str):
+        self.access_token = access_token
+        self.headers = self._headers(access_token)
+        self.total_rows_hidden = 0
+
+    @staticmethod
+    def _headers(access_token: str) -> dict[str, str]:
         return {
-            "workivaStatusCode": response.status_code,
-            "workivaResponse": response.text,
-            "sentPayload": payload,
+            "X-Version": API_VERSION,
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
         }
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"Workiva request failed: {exc}")
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Transformation failed: {exc}")
+
+    def refresh_token(self) -> None:
+        self.access_token = ApiAuth().get_auth_token()
+        self.headers = self._headers(self.access_token)
+
+    def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        token_refreshed = False
+
+        for _ in range(5):
+            try:
+                response = requests.request(
+                    method=method,
+                    url=url,
+                    headers=self.headers,
+                    timeout=60,
+                    **kwargs,
+                )
+            except requests.RequestException as exc:
+                raise RuntimeError(
+                    f"Network error while talking to Workiva.\nURL: {url}\nError: {exc}"
+                ) from exc
+
+            if response.status_code == 401 and not token_refreshed:
+                print("Bearer token expired or rejected; refreshing token...")
+                token_refreshed = True
+                self.refresh_token()
+                continue
+
+            if response.status_code == 429:
+                retry_after = int(response.headers.get("Retry-After", "5"))
+                print(f"Rate limit reached. Waiting {retry_after} seconds...")
+                time.sleep(retry_after)
+                continue
+
+            if not response.ok:
+                request_id = response.headers.get("X-Request-ID", "Not provided")
+                raise RuntimeError(
+                    "Workiva API returned an error.\n\n"
+                    f"Method: {method}\n"
+                    f"URL: {url}\n"
+                    f"HTTP status: {response.status_code}\n"
+                    f"X-Request-ID: {request_id}\n\n"
+                    f"Response:\n{response.text}"
+                )
+
+            return response
+
+        raise RuntimeError("Workiva request failed repeatedly.")
+
+    def wait_for_operation(self, response: requests.Response) -> dict[str, Any] | None:
+        if response.status_code != 202:
+            return None
+
+        operation_url = response.headers.get("Location")
+        if not operation_url:
+            try:
+                operation_url = response.json().get("operationLocation")
+            except ValueError:
+                operation_url = None
+
+        if not operation_url:
+            raise RuntimeError(
+                "Workiva returned HTTP 202, but no operation Location was supplied."
+            )
+
+        retry_after = int(response.headers.get("Retry-After", "2"))
+
+        while True:
+            time.sleep(retry_after)
+            operation_response = self.request("GET", operation_url)
+            operation = operation_response.json()
+            status = str(operation.get("status", "")).lower()
+
+            if status in ("completed", "succeeded", "success"):
+                return operation
+
+            if status in ("failed", "error", "cancelled", "canceled"):
+                raise RuntimeError(
+                    "Workiva asynchronous operation failed.\n\n"
+                    + json.dumps(operation, indent=2)
+                )
+
+            retry_after = int(
+                operation_response.headers.get("Retry-After", "2")
+            )
+
+    def get_target_spreadsheets(self) -> list[dict[str, Any]]:
+        print(
+            f"\nFinding spreadsheets containing {TARGET_NAME_TEXT!r} "
+            "(case-insensitive)..."
+        )
+
+        url = SS_API_URL
+        params = {"$maxpagesize": 1000, "$orderBy": "name asc"}
+        matches: list[dict[str, Any]] = []
+
+        while url:
+            response = self.request("GET", url, params=params)
+            result = response.json()
+
+            for spreadsheet in result.get("data", []):
+                name = str(spreadsheet.get("name", "")).strip()
+                if TARGET_NAME_TEXT in name.casefold():
+                    matches.append(spreadsheet)
+
+            url = result.get("@nextLink")
+            params = None
+
+        print(f"Found {len(matches)} matching spreadsheet(s).")
+        for spreadsheet in matches:
+            print(
+                f"  - {spreadsheet.get('name', '<unnamed>')} "
+                f"[{spreadsheet.get('id', '<no id>')}]"
+            )
+
+        return matches
+
+    def get_target_sheets(self, spreadsheet_id: str) -> list[dict[str, Any]]:
+        print(
+            f"\nFinding sheets containing {TARGET_NAME_TEXT!r} "
+            "(case-insensitive)..."
+        )
+
+        url = f"{SS_API_URL}/{spreadsheet_id}/sheets"
+        matches: list[dict[str, Any]] = []
+
+        while url:
+            response = self.request("GET", url)
+            result = response.json()
+
+            for sheet in result.get("data", []):
+                name = str(sheet.get("name", "")).strip()
+                if TARGET_NAME_TEXT in name.casefold():
+                    matches.append(sheet)
+
+            url = result.get("@nextLink")
+
+        print(f"Found {len(matches)} matching sheet(s).")
+        for sheet in matches:
+            print(
+                f"    - {sheet.get('name', '<unnamed>')} "
+                f"[{sheet.get('id', '<no id>')}]"
+            )
+
+        return matches
+
+    def get_cell_value(
+        self,
+        document_id: str,
+        table_id: str,
+        cell_range: str,
+    ) -> Any:
+        url = (
+            f"{SS_API_URL}/{document_id}/sheets/"
+            f"{table_id}/values/{cell_range}"
+        )
+        response = self.request(
+            "GET",
+            url,
+            params={"$valuestyle": "calculated"},
+        )
+
+        data = response.json().get("data", [])
+        if not data:
+            return None
+
+        values = data[0].get("values", [])
+        if not values or not values[0]:
+            return None
+
+        return values[0][0]
+
+    def set_cell_value(
+        self,
+        document_id: str,
+        table_id: str,
+        cell_range: str,
+        value: Any,
+    ) -> None:
+        url = (
+            f"{SS_API_URL}/{document_id}/sheets/"
+            f"{table_id}/values/{cell_range}"
+        )
+        response = self.request(
+            "PUT",
+            url,
+            json={"values": [[value]]},
+        )
+        self.wait_for_operation(response)
+
+    def get_table_data(
+        self,
+        document_id: str,
+        table_id: str,
+    ) -> list[list[dict[str, Any]]]:
+        url = (
+            f"{SS_API_URL}/{document_id}/sheets/"
+            f"{table_id}/sheetdata"
+        )
+        params = {
+            "$maxcellsperpage": 50000,
+            "$fields": (
+                "cells.calculatedValue,"
+                "cells.formats.valueFormat,"
+                "cells.effectiveFormats.valueFormat"
+            ),
+        }
+
+        rows: list[list[dict[str, Any]]] = []
+        first_request = True
+
+        while url:
+            response = self.request(
+                "GET",
+                url,
+                params=params if first_request else None,
+            )
+            first_request = False
+            result = response.json()
+            rows.extend(result.get("data", {}).get("cells", []))
+            url = result.get("@nextLink")
+
+        return rows
+
+    def hide_table_rows(
+        self,
+        document_id: str,
+        table_id: str,
+        row_indices: list[int],
+    ) -> None:
+        if not row_indices:
+            return
+
+        row_indices = sorted(set(row_indices))
+        self.total_rows_hidden += len(row_indices)
+
+        intervals = []
+        start_index = row_indices[0]
+        end_index = row_indices[0]
+
+        for index in row_indices[1:]:
+            if index > end_index + 1:
+                intervals.append({"start": start_index, "end": end_index})
+                start_index = index
+            end_index = index
+
+        intervals.append({"start": start_index, "end": end_index})
+
+        url = f"{SS_API_URL}/{document_id}/sheets/{table_id}/update"
+        response = self.request(
+            "POST",
+            url,
+            json={"hideRows": {"intervals": intervals}},
+        )
+        self.wait_for_operation(response)
+
+    def unhide_table_rows(
+        self,
+        document_id: str,
+        table_id: str,
+    ) -> None:
+        url = f"{SS_API_URL}/{document_id}/sheets/{table_id}/update"
+        response = self.request(
+            "POST",
+            url,
+            json={"unhideRows": {"intervals": [{}]}},
+        )
+        self.wait_for_operation(response)
+
+    def get_rows_as_displayed(
+        self,
+        document_id: str,
+        table_id: str,
+    ) -> list[list[Any]]:
+        rows_as_displayed = []
+
+        for row in self.get_table_data(document_id, table_id):
+            displayed_row = []
+
+            for cell in row:
+                calculated_value = cell.get("calculatedValue")
+
+                if not isinstance(calculated_value, decimal.Decimal):
+                    try:
+                        calculated_value = decimal.Decimal(
+                            str(calculated_value)
+                        )
+                    except (
+                        decimal.InvalidOperation,
+                        ValueError,
+                        TypeError,
+                    ):
+                        pass
+
+                displayed_value = calculated_value
+
+                if isinstance(displayed_value, decimal.Decimal):
+                    value_format = cell.get("formats", {}).get(
+                        "valueFormat", {}
+                    )
+
+                    if not value_format:
+                        value_format = cell.get(
+                            "effectiveFormats", {}
+                        ).get("valueFormat", {})
+
+                    shown_in = value_format.get("shownIn")
+                    if shown_in:
+                        precision_name = (
+                            str(shown_in)
+                            .replace(" ", "_")
+                            .upper()
+                        )
+                        if precision_name in NumberPrecision.__members__:
+                            scale = NumberPrecision[precision_name].value
+                            displayed_value /= decimal.Decimal(str(scale))
+
+                    precision = value_format.get("precision")
+                    if precision and not precision.get("auto", True):
+                        precision_value = precision.get("value", 0)
+                        displayed_value = displayed_value.quantize(
+                            decimal.Decimal(10) ** precision_value,
+                            rounding=decimal.ROUND_HALF_UP,
+                        )
+
+                displayed_row.append(displayed_value)
+
+            rows_as_displayed.append(displayed_row)
+
+        return rows_as_displayed
+
+    @staticmethod
+    def section_rows_to_hide(
+        start_row: int,
+        stop_row: int,
+        zero_rows: list[int],
+        has_numeric_data: bool,
+        has_non_zero_numeric_data: bool,
+    ) -> list[int]:
+        if has_non_zero_numeric_data:
+            return zero_rows
+
+        if has_numeric_data:
+            return list(range(start_row, stop_row + 1))
+
+        return []
+
+    def find_rows_to_hide(
+        self,
+        rows: list[list[Any]],
+    ) -> list[int]:
+        rows_to_hide = []
+        title_row = None
+        zero_rows = []
+        has_numeric_data = False
+        has_non_zero_numeric_data = False
+
+        for row_index, row in enumerate(rows):
+            is_spacer_row = True
+            has_numbers = False
+            all_zeroes = True
+
+            for cell in row:
+                if cell not in (None, ""):
+                    is_spacer_row = False
+
+                if isinstance(cell, decimal.Decimal):
+                    has_numbers = True
+                    if cell != 0:
+                        all_zeroes = False
+                        break
+
+            if is_spacer_row:
+                if title_row is not None:
+                    rows_to_hide.extend(
+                        self.section_rows_to_hide(
+                            title_row,
+                            row_index,
+                            zero_rows,
+                            has_numeric_data,
+                            has_non_zero_numeric_data,
+                        )
+                    )
+                    title_row = None
+                    zero_rows = []
+                    has_numeric_data = False
+                    has_non_zero_numeric_data = False
+
+            else:
+                if title_row is None:
+                    title_row = row_index
+
+                if has_numbers:
+                    has_numeric_data = True
+                    if all_zeroes:
+                        zero_rows.append(row_index)
+                    else:
+                        has_non_zero_numeric_data = True
+
+        if title_row is not None:
+            rows_to_hide.extend(
+                self.section_rows_to_hide(
+                    title_row,
+                    len(rows) - 1,
+                    zero_rows,
+                    has_numeric_data,
+                    has_non_zero_numeric_data,
+                )
+            )
+
+        return sorted(set(rows_to_hide))
+
+    def process_target_sheets(self, spreadsheet_id: str) -> int:
+        target_sheets = self.get_target_sheets(spreadsheet_id)
+
+        if not target_sheets:
+            print("No matching sheets in this spreadsheet. Skipping it.")
+            return 0
+
+        self.total_rows_hidden = 0
+
+        for number, sheet in enumerate(target_sheets, start=1):
+            sheet_id = sheet.get("id")
+            sheet_name = sheet.get("name", "<unnamed>")
+
+            if not sheet_id:
+                print(f"Skipping {sheet_name!r}: no sheet ID returned.")
+                continue
+
+            print("\n-----------------------------------------")
+            print(f"Processing target sheet {number}/{len(target_sheets)}")
+            print(f"Sheet name: {sheet_name}")
+            print(f"Sheet ID: {sheet_id}")
+            print("-----------------------------------------")
+
+            # Only matching sheets are ever unhidden or modified.
+            print("STEP 1: Unhide existing hidden rows in this target sheet")
+            self.unhide_table_rows(spreadsheet_id, sheet_id)
+
+            print("STEP 2: Find and hide zero rows in this target sheet")
+            rows = self.get_rows_as_displayed(spreadsheet_id, sheet_id)
+            rows_to_hide = self.find_rows_to_hide(rows)
+
+            print(f"Rows examined: {len(rows)}")
+            print(f"Rows to hide: {len(rows_to_hide)}")
+
+            if rows_to_hide:
+                self.hide_table_rows(
+                    spreadsheet_id,
+                    sheet_id,
+                    rows_to_hide,
+                )
+                print("Rows hidden successfully.")
+            else:
+                print("Nothing to hide.")
+
+        print(
+            "TOTAL ROWS HIDDEN IN MATCHING SHEETS OF THIS SPREADSHEET: "
+            f"{self.total_rows_hidden}"
+        )
+        return self.total_rows_hidden
+
+
+def normalize_boolean(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, str):
+        normalized = value.strip().upper()
+        if normalized == "TRUE":
+            return True
+        if normalized == "FALSE":
+            return False
+
+    return None
+
+
+def suppress_zeros_for_spreadsheets(
+    spreadsheet_api: SpreadsheetApi,
+    spreadsheets: list[dict[str, Any]],
+) -> None:
+    total = len(spreadsheets)
+
+    for number, spreadsheet in enumerate(spreadsheets, start=1):
+        spreadsheet_id = spreadsheet.get("id")
+        spreadsheet_name = spreadsheet.get("name", "<unnamed>")
+
+        if not spreadsheet_id:
+            print(f"Skipping {spreadsheet_name!r}: no spreadsheet ID returned.")
+            continue
+
+        print("\n\n###########################################")
+        print(f"SPREADSHEET {number}/{total}")
+        print(f"Spreadsheet name: {spreadsheet_name}")
+        print(f"Spreadsheet ID: {spreadsheet_id}")
+        print("###########################################")
+
+        # Only target sheets within this target spreadsheet are processed.
+        spreadsheet_api.process_target_sheets(spreadsheet_id)
+
+        print(f"Spreadsheet {number}/{total} completed successfully.")
+
+
+def main() -> None:
+    print("===========================================")
+    print("WORKIVA ZERO ROW HIDER - AUTO DISCOVERY")
+    print(f"API version: {API_VERSION}")
+    print(f"Python platform: {sys.platform}")
+    print(f"Requests version: {requests.__version__}")
+    print(
+        f"Target name text: {TARGET_NAME_TEXT!r} "
+        "(case-insensitive substring match)"
+    )
+    print("===========================================")
+
+    # 1. POST /oauth2/token to generate a fresh bearer token.
+    auth_token = ApiAuth().get_auth_token()
+
+    # 2. Use the bearer token for Workiva API calls.
+    spreadsheet_api = SpreadsheetApi(auth_token)
+
+    # 3. Read the TRUE/FALSE control cell.
+    print("\nChecking zero-suppression control cell...")
+    print(f"Control spreadsheet: {CONTROL_SPREADSHEET_ID}")
+    print(f"Control sheet: {CONTROL_SHEET_ID}")
+    print(f"Control cell: {CONTROL_CELL}")
+
+    raw_control_value = spreadsheet_api.get_cell_value(
+        CONTROL_SPREADSHEET_ID,
+        CONTROL_SHEET_ID,
+        CONTROL_CELL,
+    )
+    control_value = normalize_boolean(raw_control_value)
+
+    print(f"Control value returned by Workiva: {raw_control_value!r}")
+
+    if control_value is True:
+        print("Control cell is TRUE. Nothing to do.")
+        return
+
+    if control_value is not False:
+        raise RuntimeError(
+            "The control cell must contain TRUE or FALSE.\n"
+            f"Current value: {raw_control_value!r}"
+        )
+
+    print("\nCONTROL CELL IS FALSE - STARTING RUN")
+
+    # 4. GET all visible spreadsheets and keep only names containing "zero"
+    #    case-insensitively.
+    target_spreadsheets = spreadsheet_api.get_target_spreadsheets()
+
+    if not target_spreadsheets:
+        raise RuntimeError(
+            f"No spreadsheets were found whose name contains "
+            f"{TARGET_NAME_TEXT!r}. "
+            "The control cell will remain FALSE."
+        )
+
+    # 5. For every matching spreadsheet, GET its sheets and only process
+    #    sheets whose names also contain "zero" case-insensitively.
+    suppress_zeros_for_spreadsheets(
+        spreadsheet_api,
+        target_spreadsheets,
+    )
+
+    # 6. Only after every target succeeds, reset the control cell to TRUE.
+    print("\nALL MATCHING SPREADSHEETS COMPLETED SUCCESSFULLY")
+    print("Resetting control cell to TRUE...")
+
+    spreadsheet_api.set_cell_value(
+        CONTROL_SPREADSHEET_ID,
+        CONTROL_SHEET_ID,
+        CONTROL_CELL,
+        True,
+    )
+
+    print("Control cell reset to TRUE successfully.")
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
