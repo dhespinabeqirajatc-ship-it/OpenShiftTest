@@ -9,22 +9,44 @@ from typing import Any
 import requests
 
 
+# ============================================================
+# OPENSHIFT CONFIGURATION
+# ============================================================
+
 CLIENT_ID = os.getenv("WORKIVA_CLIENT_ID", "").strip()
 CLIENT_SECRET = os.getenv("WORKIVA_CLIENT_SECRET", "").strip()
-CONTROL_SPREADSHEET_ID = os.getenv("WORKIVA_CONTROL_SPREADSHEET_ID", "").strip()
-CONTROL_SHEET_ID = os.getenv("WORKIVA_CONTROL_SHEET_ID", "").strip()
-CONTROL_CELL = os.getenv("WORKIVA_CONTROL_CELL", "B2").strip() or "B2"
-API_VERSION = os.getenv("WORKIVA_API_VERSION", "2026-01-01").strip()
+
+CONTROL_SPREADSHEET_ID = os.getenv(
+    "WORKIVA_CONTROL_SPREADSHEET_ID", ""
+).strip()
+
+CONTROL_SHEET_ID = os.getenv(
+    "WORKIVA_CONTROL_SHEET_ID", ""
+).strip()
+
+CONTROL_CELL = os.getenv(
+    "WORKIVA_CONTROL_CELL", "B2"
+).strip() or "B2"
+
+API_VERSION = os.getenv(
+    "WORKIVA_API_VERSION", "2026-01-01"
+).strip()
+
 BASE_URL = os.getenv(
     "WORKIVA_BASE_URL",
     "https://api.eu.wdesk.com",
 ).strip().rstrip("/")
-TARGET_NAME_TEXT = os.getenv(
-    "WORKIVA_TARGET_NAME_TEXT", "zero"
+
+# Exact, case-insensitive target name.
+# "Zero", "zero", " ZERO " all match.
+# "Zero Adjustments" does NOT match.
+TARGET_NAME = os.getenv(
+    "WORKIVA_TARGET_NAME", "zero"
 ).strip().casefold() or "zero"
 
 AUTH_URL = f"{BASE_URL}/oauth2/token"
 SS_API_URL = f"{BASE_URL}/spreadsheets"
+
 
 required_settings = {
     "WORKIVA_CLIENT_ID": CLIENT_ID,
@@ -32,7 +54,12 @@ required_settings = {
     "WORKIVA_CONTROL_SPREADSHEET_ID": CONTROL_SPREADSHEET_ID,
     "WORKIVA_CONTROL_SHEET_ID": CONTROL_SHEET_ID,
 }
-missing_settings = [k for k, v in required_settings.items() if not v]
+
+missing_settings = [
+    key for key, value in required_settings.items()
+    if not value
+]
+
 if missing_settings:
     raise RuntimeError(
         "Missing required OpenShift environment variable(s): "
@@ -40,17 +67,9 @@ if missing_settings:
     )
 
 
-class NumberPrecision(Enum):
-    BASIS_POINTS = 0.0001
-    HUNDREDTHS = 0.01
-    ONES = 1
-    THOUSANDS = 1_000
-    TEN_THOUSANDS = 10_000
-    MILLIONS = 1_000_000
-    HUNDRED_MILLIONS = 100_000_000
-    BILLIONS = 1_000_000_000
-    TRILLIONS = 1_000_000_000_000
-
+# ============================================================
+# AUTHENTICATION
+# ============================================================
 
 class ApiAuth:
     def __init__(self):
@@ -62,6 +81,7 @@ class ApiAuth:
 
     def get_auth_token(self) -> str:
         print("Authenticating with Workiva...")
+
         try:
             response = requests.post(
                 AUTH_URL,
@@ -88,23 +108,28 @@ class ApiAuth:
             )
 
         access_token = response.json().get("access_token")
+
         if not access_token:
             raise RuntimeError(
-                "Authentication returned HTTP 200, but no access_token."
+                "Authentication returned HTTP 200 but no access_token."
             )
 
         print("Authentication successful.")
         return access_token
 
 
+# ============================================================
+# WORKIVA API CLIENT
+# ============================================================
+
 class SpreadsheetApi:
     def __init__(self, access_token: str):
         self.access_token = access_token
-        self.headers = self._headers(access_token)
+        self.headers = self._make_headers(access_token)
         self.total_rows_hidden = 0
 
     @staticmethod
-    def _headers(access_token: str) -> dict[str, str]:
+    def _make_headers(access_token: str) -> dict[str, str]:
         return {
             "X-Version": API_VERSION,
             "Authorization": f"Bearer {access_token}",
@@ -113,10 +138,23 @@ class SpreadsheetApi:
         }
 
     def refresh_token(self) -> None:
+        print("Refreshing Workiva access token...")
         self.access_token = ApiAuth().get_auth_token()
-        self.headers = self._headers(self.access_token)
+        self.headers = self._make_headers(self.access_token)
 
-    def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+    def request(
+        self,
+        method: str,
+        url: str,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """
+        Workiva request helper:
+        - retries rate limits
+        - refreshes an expired token once on HTTP 401
+        - reports Workiva request IDs for troubleshooting
+        """
+
         token_refreshed = False
 
         for _ in range(5):
@@ -130,23 +168,31 @@ class SpreadsheetApi:
                 )
             except requests.RequestException as exc:
                 raise RuntimeError(
-                    f"Network error while talking to Workiva.\nURL: {url}\nError: {exc}"
+                    "Network error while talking to Workiva.\n"
+                    f"URL: {url}\n"
+                    f"Error: {exc}"
                 ) from exc
 
             if response.status_code == 401 and not token_refreshed:
-                print("Bearer token expired or rejected; refreshing token...")
                 token_refreshed = True
                 self.refresh_token()
                 continue
 
             if response.status_code == 429:
-                retry_after = int(response.headers.get("Retry-After", "5"))
-                print(f"Rate limit reached. Waiting {retry_after} seconds...")
+                retry_after = int(
+                    response.headers.get("Retry-After", "5")
+                )
+                print(
+                    f"Rate limit reached. Waiting {retry_after} seconds..."
+                )
                 time.sleep(retry_after)
                 continue
 
             if not response.ok:
-                request_id = response.headers.get("X-Request-ID", "Not provided")
+                request_id = response.headers.get(
+                    "X-Request-ID",
+                    "Not provided",
+                )
                 raise RuntimeError(
                     "Workiva API returned an error.\n\n"
                     f"Method: {method}\n"
@@ -158,126 +204,324 @@ class SpreadsheetApi:
 
             return response
 
-        raise RuntimeError("Workiva request failed repeatedly.")
+        raise RuntimeError(
+            "Workiva request failed repeatedly."
+        )
 
-    def wait_for_operation(self, response: requests.Response) -> dict[str, Any] | None:
+    def wait_for_operation(
+        self,
+        response: requests.Response,
+    ) -> dict[str, Any] | None:
         if response.status_code != 202:
             return None
 
         operation_url = response.headers.get("Location")
+
         if not operation_url:
             try:
-                operation_url = response.json().get("operationLocation")
+                operation_url = response.json().get(
+                    "operationLocation"
+                )
             except ValueError:
                 operation_url = None
 
         if not operation_url:
             raise RuntimeError(
-                "Workiva returned HTTP 202, but no operation Location was supplied."
+                "Workiva returned HTTP 202 but no operation "
+                "Location was supplied."
             )
 
-        retry_after = int(response.headers.get("Retry-After", "2"))
+        retry_after = int(
+            response.headers.get("Retry-After", "2")
+        )
 
         while True:
             time.sleep(retry_after)
-            operation_response = self.request("GET", operation_url)
-            operation = operation_response.json()
-            status = str(operation.get("status", "")).lower()
 
-            if status in ("completed", "succeeded", "success"):
+            operation_response = self.request(
+                "GET",
+                operation_url,
+            )
+
+            operation = operation_response.json()
+            status = str(
+                operation.get("status", "")
+            ).lower()
+
+            if status in (
+                "completed",
+                "succeeded",
+                "success",
+            ):
                 return operation
 
-            if status in ("failed", "error", "cancelled", "canceled"):
+            if status in (
+                "failed",
+                "error",
+                "cancelled",
+                "canceled",
+            ):
                 raise RuntimeError(
                     "Workiva asynchronous operation failed.\n\n"
                     + json.dumps(operation, indent=2)
                 )
 
             retry_after = int(
-                operation_response.headers.get("Retry-After", "2")
+                operation_response.headers.get(
+                    "Retry-After", "2"
+                )
             )
 
-    def get_target_spreadsheets(self) -> list[dict[str, Any]]:
-        print(
-            f"\nFinding spreadsheets containing {TARGET_NAME_TEXT!r} "
-            "(case-insensitive)..."
-        )
+    # ========================================================
+    # 1. GET ALL SPREADSHEETS: NAME + ID
+    # ========================================================
+
+    def get_all_spreadsheets(
+        self,
+    ) -> list[dict[str, Any]]:
+        """
+        Retrieve every spreadsheet visible to this OAuth client.
+        Follows @nextLink until all pages are collected.
+        """
+
+        print("\nRetrieving all Workiva spreadsheets...")
 
         url = SS_API_URL
-        params = {"$maxpagesize": 1000, "$orderBy": "name asc"}
-        matches: list[dict[str, Any]] = []
+        params = {
+            "$maxpagesize": 1000,
+            "$orderBy": "name asc",
+        }
+
+        spreadsheets: list[dict[str, Any]] = []
 
         while url:
-            response = self.request("GET", url, params=params)
+            response = self.request(
+                "GET",
+                url,
+                params=params,
+            )
+
             result = response.json()
 
             for spreadsheet in result.get("data", []):
-                name = str(spreadsheet.get("name", "")).strip()
-                if TARGET_NAME_TEXT in name.casefold():
-                    matches.append(spreadsheet)
+                spreadsheet_id = spreadsheet.get("id")
+                spreadsheet_name = str(
+                    spreadsheet.get("name", "")
+                ).strip()
+
+                if spreadsheet_id:
+                    spreadsheets.append(
+                        {
+                            "id": spreadsheet_id,
+                            "name": spreadsheet_name,
+                        }
+                    )
 
             url = result.get("@nextLink")
             params = None
 
-        print(f"Found {len(matches)} matching spreadsheet(s).")
+        print(
+            f"Retrieved {len(spreadsheets)} spreadsheet(s)."
+        )
+
+        for spreadsheet in spreadsheets:
+            print(
+                f"  Spreadsheet: {spreadsheet['name']} "
+                f"| ID: {spreadsheet['id']}"
+            )
+
+        return spreadsheets
+
+    @staticmethod
+    def exact_name_matches(
+        name: str,
+    ) -> bool:
+        return str(name).strip().casefold() == TARGET_NAME
+
+    def filter_zero_spreadsheets(
+        self,
+        spreadsheets: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        matches = [
+            spreadsheet
+            for spreadsheet in spreadsheets
+            if self.exact_name_matches(
+                spreadsheet.get("name", "")
+            )
+        ]
+
+        print(
+            f"\nSpreadsheet exact-name filter {TARGET_NAME!r}: "
+            f"{len(matches)} match(es)."
+        )
+
         for spreadsheet in matches:
             print(
-                f"  - {spreadsheet.get('name', '<unnamed>')} "
-                f"[{spreadsheet.get('id', '<no id>')}]"
+                f"  MATCH: {spreadsheet['name']} "
+                f"| ID: {spreadsheet['id']}"
             )
 
         return matches
 
-    def get_target_sheets(self, spreadsheet_id: str) -> list[dict[str, Any]]:
+    # ========================================================
+    # 2. GET ALL SHEETS: NAME + ID, THEN FILTER
+    # ========================================================
+
+    @staticmethod
+    def _flatten_sheets(
+        sheets: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Workiva sheets can be hierarchical. Flatten top-level and
+        child sheets so every returned sheet name/ID can be evaluated.
+        """
+
+        flattened: list[dict[str, Any]] = []
+
+        def visit(sheet: dict[str, Any]) -> None:
+            flattened.append(sheet)
+
+            children = sheet.get("children") or []
+
+            for child in children:
+                if isinstance(child, dict):
+                    visit(child)
+
+        for sheet in sheets:
+            if isinstance(sheet, dict):
+                visit(sheet)
+
+        return flattened
+
+    def get_all_sheets(
+        self,
+        spreadsheet_id: str,
+    ) -> list[dict[str, Any]]:
         print(
-            f"\nFinding sheets containing {TARGET_NAME_TEXT!r} "
-            "(case-insensitive)..."
+            f"\nRetrieving all sheets for spreadsheet "
+            f"{spreadsheet_id}..."
         )
 
-        url = f"{SS_API_URL}/{spreadsheet_id}/sheets"
-        matches: list[dict[str, Any]] = []
+        url = (
+            f"{SS_API_URL}/"
+            f"{spreadsheet_id}/sheets"
+        )
+
+        raw_sheets: list[dict[str, Any]] = []
 
         while url:
-            response = self.request("GET", url)
+            response = self.request(
+                "GET",
+                url,
+            )
+
             result = response.json()
 
-            for sheet in result.get("data", []):
-                name = str(sheet.get("name", "")).strip()
-                if TARGET_NAME_TEXT in name.casefold():
-                    matches.append(sheet)
+            raw_sheets.extend(
+                result.get("data", [])
+            )
 
             url = result.get("@nextLink")
 
-        print(f"Found {len(matches)} matching sheet(s).")
+        flattened = self._flatten_sheets(
+            raw_sheets
+        )
+
+        # De-duplicate in case child sheets are also returned
+        # independently by the endpoint.
+        seen_ids: set[str] = set()
+        sheets: list[dict[str, Any]] = []
+
+        for sheet in flattened:
+            sheet_id = sheet.get("id")
+
+            if not sheet_id or sheet_id in seen_ids:
+                continue
+
+            seen_ids.add(sheet_id)
+
+            sheets.append(
+                {
+                    "id": sheet_id,
+                    "name": str(
+                        sheet.get("name", "")
+                    ).strip(),
+                }
+            )
+
+        print(
+            f"Retrieved {len(sheets)} sheet(s)."
+        )
+
+        for sheet in sheets:
+            print(
+                f"    Sheet: {sheet['name']} "
+                f"| ID: {sheet['id']}"
+            )
+
+        return sheets
+
+    def filter_zero_sheets(
+        self,
+        sheets: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        matches = [
+            sheet
+            for sheet in sheets
+            if self.exact_name_matches(
+                sheet.get("name", "")
+            )
+        ]
+
+        print(
+            f"Sheet exact-name filter {TARGET_NAME!r}: "
+            f"{len(matches)} match(es)."
+        )
+
         for sheet in matches:
             print(
-                f"    - {sheet.get('name', '<unnamed>')} "
-                f"[{sheet.get('id', '<no id>')}]"
+                f"    MATCH: {sheet['name']} "
+                f"| ID: {sheet['id']}"
             )
 
         return matches
 
+    # ========================================================
+    # CONTROL CELL
+    # ========================================================
+
     def get_cell_value(
         self,
-        document_id: str,
-        table_id: str,
+        spreadsheet_id: str,
+        sheet_id: str,
         cell_range: str,
     ) -> Any:
         url = (
-            f"{SS_API_URL}/{document_id}/sheets/"
-            f"{table_id}/values/{cell_range}"
+            f"{SS_API_URL}/"
+            f"{spreadsheet_id}/sheets/"
+            f"{sheet_id}/values/"
+            f"{cell_range}"
         )
+
         response = self.request(
             "GET",
             url,
-            params={"$valuestyle": "calculated"},
+            params={
+                "$valuestyle": "calculated",
+            },
         )
 
-        data = response.json().get("data", [])
+        data = response.json().get(
+            "data", []
+        )
+
         if not data:
             return None
 
-        values = data[0].get("values", [])
+        values = data[0].get(
+            "values", []
+        )
+
         if not values or not values[0]:
             return None
 
@@ -285,370 +529,421 @@ class SpreadsheetApi:
 
     def set_cell_value(
         self,
-        document_id: str,
-        table_id: str,
+        spreadsheet_id: str,
+        sheet_id: str,
         cell_range: str,
         value: Any,
     ) -> None:
         url = (
-            f"{SS_API_URL}/{document_id}/sheets/"
-            f"{table_id}/values/{cell_range}"
+            f"{SS_API_URL}/"
+            f"{spreadsheet_id}/sheets/"
+            f"{sheet_id}/values/"
+            f"{cell_range}"
         )
+
         response = self.request(
             "PUT",
             url,
-            json={"values": [[value]]},
+            json={
+                "values": [
+                    [value]
+                ]
+            },
         )
-        self.wait_for_operation(response)
 
-    def get_table_data(
-        self,
-        document_id: str,
-        table_id: str,
-    ) -> list[list[dict[str, Any]]]:
-        url = (
-            f"{SS_API_URL}/{document_id}/sheets/"
-            f"{table_id}/sheetdata"
+        self.wait_for_operation(
+            response
         )
+
+    # ========================================================
+    # 3. READ TARGET SHEET
+    # ========================================================
+
+    def get_sheet_rows(
+        self,
+        spreadsheet_id: str,
+        sheet_id: str,
+    ) -> list[list[Any]]:
+        """
+        Read calculated values from the entire sheet.
+        """
+
+        url = (
+            f"{SS_API_URL}/"
+            f"{spreadsheet_id}/sheets/"
+            f"{sheet_id}/sheetdata"
+        )
+
         params = {
             "$maxcellsperpage": 50000,
-            "$fields": (
-                "cells.calculatedValue,"
-                "cells.formats.valueFormat,"
-                "cells.effectiveFormats.valueFormat"
-            ),
+            "$fields": "cells.calculatedValue",
         }
 
-        rows: list[list[dict[str, Any]]] = []
         first_request = True
+        rows: list[list[Any]] = []
 
         while url:
             response = self.request(
                 "GET",
                 url,
-                params=params if first_request else None,
+                params=(
+                    params
+                    if first_request
+                    else None
+                ),
             )
+
             first_request = False
+
             result = response.json()
-            rows.extend(result.get("data", {}).get("cells", []))
+
+            cells = (
+                result
+                .get("data", {})
+                .get("cells", [])
+            )
+
+            for row in cells:
+                rows.append(
+                    [
+                        cell.get("calculatedValue")
+                        if isinstance(cell, dict)
+                        else None
+                        for cell in row
+                    ]
+                )
+
             url = result.get("@nextLink")
 
         return rows
 
-    def hide_table_rows(
+    # ========================================================
+    # 4. FIND EVERY ROW THAT CONTAINS NUMERIC ZERO
+    # ========================================================
+
+    @staticmethod
+    def is_numeric_zero(
+        value: Any,
+    ) -> bool:
+        """
+        Treat numeric 0 values as zero.
+
+        Handles Workiva JSON numbers and numeric strings such as:
+        0, 0.0, "0", "0.00".
+
+        Blank cells, booleans, and arbitrary text do not count.
+        """
+
+        if value is None or value == "":
+            return False
+
+        if isinstance(value, bool):
+            return False
+
+        try:
+            return decimal.Decimal(
+                str(value).strip()
+            ) == 0
+        except (
+            decimal.InvalidOperation,
+            ValueError,
+            TypeError,
+        ):
+            return False
+
+    def find_rows_containing_zero(
         self,
-        document_id: str,
-        table_id: str,
+        rows: list[list[Any]],
+    ) -> list[int]:
+        """
+        Hide a row if ANY cell in that row is numeric zero.
+        """
+
+        matching_rows: list[int] = []
+
+        for row_index, row in enumerate(
+            rows
+        ):
+            if any(
+                self.is_numeric_zero(cell)
+                for cell in row
+            ):
+                matching_rows.append(
+                    row_index
+                )
+
+        return matching_rows
+
+    # ========================================================
+    # 5. HIDE MATCHING ROWS
+    # ========================================================
+
+    def hide_rows(
+        self,
+        spreadsheet_id: str,
+        sheet_id: str,
         row_indices: list[int],
     ) -> None:
         if not row_indices:
+            print(
+                "No rows containing numeric zero were found."
+            )
             return
 
-        row_indices = sorted(set(row_indices))
-        self.total_rows_hidden += len(row_indices)
+        row_indices = sorted(
+            set(row_indices)
+        )
 
         intervals = []
+
         start_index = row_indices[0]
         end_index = row_indices[0]
 
         for index in row_indices[1:]:
-            if index > end_index + 1:
-                intervals.append({"start": start_index, "end": end_index})
-                start_index = index
-            end_index = index
-
-        intervals.append({"start": start_index, "end": end_index})
-
-        url = f"{SS_API_URL}/{document_id}/sheets/{table_id}/update"
-        response = self.request(
-            "POST",
-            url,
-            json={"hideRows": {"intervals": intervals}},
-        )
-        self.wait_for_operation(response)
-
-    def unhide_table_rows(
-        self,
-        document_id: str,
-        table_id: str,
-    ) -> None:
-        url = f"{SS_API_URL}/{document_id}/sheets/{table_id}/update"
-        response = self.request(
-            "POST",
-            url,
-            json={"unhideRows": {"intervals": [{}]}},
-        )
-        self.wait_for_operation(response)
-
-    def get_rows_as_displayed(
-        self,
-        document_id: str,
-        table_id: str,
-    ) -> list[list[Any]]:
-        rows_as_displayed = []
-
-        for row in self.get_table_data(document_id, table_id):
-            displayed_row = []
-
-            for cell in row:
-                calculated_value = cell.get("calculatedValue")
-
-                if not isinstance(calculated_value, decimal.Decimal):
-                    try:
-                        calculated_value = decimal.Decimal(
-                            str(calculated_value)
-                        )
-                    except (
-                        decimal.InvalidOperation,
-                        ValueError,
-                        TypeError,
-                    ):
-                        pass
-
-                displayed_value = calculated_value
-
-                if isinstance(displayed_value, decimal.Decimal):
-                    value_format = cell.get("formats", {}).get(
-                        "valueFormat", {}
-                    )
-
-                    if not value_format:
-                        value_format = cell.get(
-                            "effectiveFormats", {}
-                        ).get("valueFormat", {})
-
-                    shown_in = value_format.get("shownIn")
-                    if shown_in:
-                        precision_name = (
-                            str(shown_in)
-                            .replace(" ", "_")
-                            .upper()
-                        )
-                        if precision_name in NumberPrecision.__members__:
-                            scale = NumberPrecision[precision_name].value
-                            displayed_value /= decimal.Decimal(str(scale))
-
-                    precision = value_format.get("precision")
-                    if precision and not precision.get("auto", True):
-                        precision_value = precision.get("value", 0)
-                        displayed_value = displayed_value.quantize(
-                            decimal.Decimal(10) ** precision_value,
-                            rounding=decimal.ROUND_HALF_UP,
-                        )
-
-                displayed_row.append(displayed_value)
-
-            rows_as_displayed.append(displayed_row)
-
-        return rows_as_displayed
-
-    @staticmethod
-    def section_rows_to_hide(
-        start_row: int,
-        stop_row: int,
-        zero_rows: list[int],
-        has_numeric_data: bool,
-        has_non_zero_numeric_data: bool,
-    ) -> list[int]:
-        if has_non_zero_numeric_data:
-            return zero_rows
-
-        if has_numeric_data:
-            return list(range(start_row, stop_row + 1))
-
-        return []
-
-    def find_rows_to_hide(
-        self,
-        rows: list[list[Any]],
-    ) -> list[int]:
-        rows_to_hide = []
-        title_row = None
-        zero_rows = []
-        has_numeric_data = False
-        has_non_zero_numeric_data = False
-
-        for row_index, row in enumerate(rows):
-            is_spacer_row = True
-            has_numbers = False
-            all_zeroes = True
-
-            for cell in row:
-                if cell not in (None, ""):
-                    is_spacer_row = False
-
-                if isinstance(cell, decimal.Decimal):
-                    has_numbers = True
-                    if cell != 0:
-                        all_zeroes = False
-                        break
-
-            if is_spacer_row:
-                if title_row is not None:
-                    rows_to_hide.extend(
-                        self.section_rows_to_hide(
-                            title_row,
-                            row_index,
-                            zero_rows,
-                            has_numeric_data,
-                            has_non_zero_numeric_data,
-                        )
-                    )
-                    title_row = None
-                    zero_rows = []
-                    has_numeric_data = False
-                    has_non_zero_numeric_data = False
-
-            else:
-                if title_row is None:
-                    title_row = row_index
-
-                if has_numbers:
-                    has_numeric_data = True
-                    if all_zeroes:
-                        zero_rows.append(row_index)
-                    else:
-                        has_non_zero_numeric_data = True
-
-        if title_row is not None:
-            rows_to_hide.extend(
-                self.section_rows_to_hide(
-                    title_row,
-                    len(rows) - 1,
-                    zero_rows,
-                    has_numeric_data,
-                    has_non_zero_numeric_data,
-                )
-            )
-
-        return sorted(set(rows_to_hide))
-
-    def process_target_sheets(self, spreadsheet_id: str) -> int:
-        target_sheets = self.get_target_sheets(spreadsheet_id)
-
-        if not target_sheets:
-            print("No matching sheets in this spreadsheet. Skipping it.")
-            return 0
-
-        self.total_rows_hidden = 0
-
-        for number, sheet in enumerate(target_sheets, start=1):
-            sheet_id = sheet.get("id")
-            sheet_name = sheet.get("name", "<unnamed>")
-
-            if not sheet_id:
-                print(f"Skipping {sheet_name!r}: no sheet ID returned.")
+            if index == end_index + 1:
+                end_index = index
                 continue
 
-            print("\n-----------------------------------------")
-            print(f"Processing target sheet {number}/{len(target_sheets)}")
-            print(f"Sheet name: {sheet_name}")
-            print(f"Sheet ID: {sheet_id}")
-            print("-----------------------------------------")
+            intervals.append(
+                {
+                    "start": start_index,
+                    "end": end_index,
+                }
+            )
 
-            # Only matching sheets are ever unhidden or modified.
-            print("STEP 1: Unhide existing hidden rows in this target sheet")
-            self.unhide_table_rows(spreadsheet_id, sheet_id)
+            start_index = index
+            end_index = index
 
-            print("STEP 2: Find and hide zero rows in this target sheet")
-            rows = self.get_rows_as_displayed(spreadsheet_id, sheet_id)
-            rows_to_hide = self.find_rows_to_hide(rows)
+        intervals.append(
+            {
+                "start": start_index,
+                "end": end_index,
+            }
+        )
 
-            print(f"Rows examined: {len(rows)}")
-            print(f"Rows to hide: {len(rows_to_hide)}")
+        url = (
+            f"{SS_API_URL}/"
+            f"{spreadsheet_id}/sheets/"
+            f"{sheet_id}/update"
+        )
 
-            if rows_to_hide:
-                self.hide_table_rows(
-                    spreadsheet_id,
-                    sheet_id,
-                    rows_to_hide,
-                )
-                print("Rows hidden successfully.")
-            else:
-                print("Nothing to hide.")
+        response = self.request(
+            "POST",
+            url,
+            json={
+                "hideRows": {
+                    "intervals": intervals
+                }
+            },
+        )
+
+        self.wait_for_operation(
+            response
+        )
+
+        self.total_rows_hidden += len(
+            row_indices
+        )
 
         print(
-            "TOTAL ROWS HIDDEN IN MATCHING SHEETS OF THIS SPREADSHEET: "
+            f"Hidden {len(row_indices)} row(s) "
+            "containing numeric zero."
+        )
+
+    # ========================================================
+    # COMPLETE DISCOVERY + FILTER + HIDE FLOW
+    # ========================================================
+
+    def process_zero_targets(
+        self,
+    ) -> None:
+        # A. Get names and IDs of every spreadsheet.
+        all_spreadsheets = (
+            self.get_all_spreadsheets()
+        )
+
+        # B. Exact case-insensitive spreadsheet name = "zero".
+        zero_spreadsheets = (
+            self.filter_zero_spreadsheets(
+                all_spreadsheets
+            )
+        )
+
+        if not zero_spreadsheets:
+            raise RuntimeError(
+                "No spreadsheet named 'Zero' "
+                "(case-insensitive) was found."
+            )
+
+        for spreadsheet_number, spreadsheet in enumerate(
+            zero_spreadsheets,
+            start=1,
+        ):
+            spreadsheet_id = spreadsheet["id"]
+            spreadsheet_name = spreadsheet["name"]
+
+            print("\n")
+            print("===========================================")
+            print(
+                f"TARGET SPREADSHEET "
+                f"{spreadsheet_number}/"
+                f"{len(zero_spreadsheets)}"
+            )
+            print(
+                f"Name: {spreadsheet_name}"
+            )
+            print(
+                f"ID: {spreadsheet_id}"
+            )
+            print("===========================================")
+
+            # C. Get names and IDs of every sheet in this spreadsheet.
+            all_sheets = self.get_all_sheets(
+                spreadsheet_id
+            )
+
+            # D. Exact case-insensitive sheet name = "zero".
+            zero_sheets = self.filter_zero_sheets(
+                all_sheets
+            )
+
+            if not zero_sheets:
+                print(
+                    "No sheet named 'Zero' "
+                    "(case-insensitive) in this spreadsheet. "
+                    "Skipping."
+                )
+                continue
+
+            for sheet_number, sheet in enumerate(
+                zero_sheets,
+                start=1,
+            ):
+                sheet_id = sheet["id"]
+                sheet_name = sheet["name"]
+
+                print("\n-------------------------------------------")
+                print(
+                    f"TARGET SHEET "
+                    f"{sheet_number}/"
+                    f"{len(zero_sheets)}"
+                )
+                print(
+                    f"Name: {sheet_name}"
+                )
+                print(
+                    f"ID: {sheet_id}"
+                )
+                print("-------------------------------------------")
+
+                rows = self.get_sheet_rows(
+                    spreadsheet_id,
+                    sheet_id,
+                )
+
+                print(
+                    f"Rows read: {len(rows)}"
+                )
+
+                zero_rows = (
+                    self.find_rows_containing_zero(
+                        rows
+                    )
+                )
+
+                print(
+                    f"Rows containing numeric zero: "
+                    f"{len(zero_rows)}"
+                )
+
+                self.hide_rows(
+                    spreadsheet_id,
+                    sheet_id,
+                    zero_rows,
+                )
+
+        print("\n===========================================")
+        print(
+            f"TOTAL ROWS HIDDEN: "
             f"{self.total_rows_hidden}"
         )
-        return self.total_rows_hidden
+        print("===========================================")
 
 
-def normalize_boolean(value: Any) -> bool | None:
+# ============================================================
+# CONTROL FLAG
+# ============================================================
+
+def normalize_boolean(
+    value: Any,
+) -> bool | None:
     if isinstance(value, bool):
         return value
 
     if isinstance(value, str):
         normalized = value.strip().upper()
+
         if normalized == "TRUE":
             return True
+
         if normalized == "FALSE":
             return False
 
     return None
 
 
-def suppress_zeros_for_spreadsheets(
-    spreadsheet_api: SpreadsheetApi,
-    spreadsheets: list[dict[str, Any]],
-) -> None:
-    total = len(spreadsheets)
-
-    for number, spreadsheet in enumerate(spreadsheets, start=1):
-        spreadsheet_id = spreadsheet.get("id")
-        spreadsheet_name = spreadsheet.get("name", "<unnamed>")
-
-        if not spreadsheet_id:
-            print(f"Skipping {spreadsheet_name!r}: no spreadsheet ID returned.")
-            continue
-
-        print("\n\n###########################################")
-        print(f"SPREADSHEET {number}/{total}")
-        print(f"Spreadsheet name: {spreadsheet_name}")
-        print(f"Spreadsheet ID: {spreadsheet_id}")
-        print("###########################################")
-
-        # Only target sheets within this target spreadsheet are processed.
-        spreadsheet_api.process_target_sheets(spreadsheet_id)
-
-        print(f"Spreadsheet {number}/{total} completed successfully.")
-
+# ============================================================
+# MAIN
+# ============================================================
 
 def main() -> None:
     print("===========================================")
-    print("WORKIVA ZERO ROW HIDER - AUTO DISCOVERY")
+    print("WORKIVA ZERO ROW HIDER")
+    print("DISCOVERY -> FILTER -> HIDE")
     print(f"API version: {API_VERSION}")
     print(f"Python platform: {sys.platform}")
     print(f"Requests version: {requests.__version__}")
     print(
-        f"Target name text: {TARGET_NAME_TEXT!r} "
-        "(case-insensitive substring match)"
+        "Spreadsheet/sheet target name: "
+        "'Zero' (exact, case-insensitive)"
+    )
+    print(
+        "Row rule: hide row when ANY cell "
+        "contains numeric zero"
     )
     print("===========================================")
 
-    # 1. POST /oauth2/token to generate a fresh bearer token.
-    auth_token = ApiAuth().get_auth_token()
+    # 1. Generate a fresh bearer token.
+    token = ApiAuth().get_auth_token()
 
-    # 2. Use the bearer token for Workiva API calls.
-    spreadsheet_api = SpreadsheetApi(auth_token)
+    # 2. Create API client.
+    api = SpreadsheetApi(token)
 
-    # 3. Read the TRUE/FALSE control cell.
-    print("\nChecking zero-suppression control cell...")
-    print(f"Control spreadsheet: {CONTROL_SPREADSHEET_ID}")
-    print(f"Control sheet: {CONTROL_SHEET_ID}")
-    print(f"Control cell: {CONTROL_CELL}")
+    # 3. Keep the existing TRUE/FALSE control mechanism.
+    print(
+        "\nChecking zero-suppression control cell..."
+    )
 
-    raw_control_value = spreadsheet_api.get_cell_value(
+    raw_control_value = api.get_cell_value(
         CONTROL_SPREADSHEET_ID,
         CONTROL_SHEET_ID,
         CONTROL_CELL,
     )
-    control_value = normalize_boolean(raw_control_value)
 
-    print(f"Control value returned by Workiva: {raw_control_value!r}")
+    control_value = normalize_boolean(
+        raw_control_value
+    )
+
+    print(
+        f"Control value: "
+        f"{raw_control_value!r}"
+    )
 
     if control_value is True:
-        print("Control cell is TRUE. Nothing to do.")
+        print(
+            "Control cell is TRUE. "
+            "No run requested."
+        )
         return
 
     if control_value is not False:
@@ -657,38 +952,27 @@ def main() -> None:
             f"Current value: {raw_control_value!r}"
         )
 
-    print("\nCONTROL CELL IS FALSE - STARTING RUN")
+    # 4. Discover/filter/process.
+    api.process_zero_targets()
 
-    # 4. GET all visible spreadsheets and keep only names containing "zero"
-    #    case-insensitively.
-    target_spreadsheets = spreadsheet_api.get_target_spreadsheets()
-
-    if not target_spreadsheets:
-        raise RuntimeError(
-            f"No spreadsheets were found whose name contains "
-            f"{TARGET_NAME_TEXT!r}. "
-            "The control cell will remain FALSE."
-        )
-
-    # 5. For every matching spreadsheet, GET its sheets and only process
-    #    sheets whose names also contain "zero" case-insensitively.
-    suppress_zeros_for_spreadsheets(
-        spreadsheet_api,
-        target_spreadsheets,
+    # 5. Only reset TRUE after the entire run succeeds.
+    print(
+        "\nAll target processing completed successfully."
+    )
+    print(
+        "Resetting control cell to TRUE..."
     )
 
-    # 6. Only after every target succeeds, reset the control cell to TRUE.
-    print("\nALL MATCHING SPREADSHEETS COMPLETED SUCCESSFULLY")
-    print("Resetting control cell to TRUE...")
-
-    spreadsheet_api.set_cell_value(
+    api.set_cell_value(
         CONTROL_SPREADSHEET_ID,
         CONTROL_SHEET_ID,
         CONTROL_CELL,
         True,
     )
 
-    print("Control cell reset to TRUE successfully.")
+    print(
+        "Control cell reset to TRUE."
+    )
     print("Done.")
 
 
